@@ -185,14 +185,21 @@ _WORKER_SQL = """
                and a2.date >= %(on_date)s
                and a2.date < %(on_date)s::date + %(window)s::int) as free_days,
            crew.crew_id, crew.crew_name, crew.leader_id, crew.leader_name,
-           crew.leader_status
+           crew.leader_status, crew.leader_committed
       from workers w
       left join lateral (
            select c.id as crew_id, c.name as crew_name,
                   leader.id as leader_id, leader.name as leader_name,
                   (select a3.status from availability a3
                     where a3.worker_id = leader.id
-                      and a3.date = %(on_date)s) as leader_status
+                      and a3.date = %(on_date)s) as leader_status,
+                  exists (select 1
+                            from job_assignments ja2
+                            join jobs j2 on j2.id = ja2.job_id
+                           where ja2.worker_id = leader.id
+                             and j2.date = %(on_date)s
+                             and ja2.status in ('accepted', 'confirmed'))
+                      as leader_committed
              from crew_members cm
              join crews c on c.id = cm.crew_id
              left join workers leader on leader.id = c.leader_worker_id
@@ -228,6 +235,13 @@ _CREW_MEMBER_SQL = """
            (select a3.status from availability a3
              where a3.worker_id = c.leader_worker_id
                and a3.date = %(on_date)s) as leader_status,
+           exists (select 1
+                     from job_assignments ja2
+                     join jobs j2 on j2.id = ja2.job_id
+                    where ja2.worker_id = c.leader_worker_id
+                      and j2.date = %(on_date)s
+                      and ja2.status in ('accepted', 'confirmed'))
+               as leader_committed,
            w.id as worker_id, w.name as worker_name,
            w.experience_years, ws.years_experience as skill_years,
            (select count(*)
@@ -250,6 +264,32 @@ _CREW_MEMBER_SQL = """
        and c.verification_status = 'verified'
        and w.verification_status = 'verified'
 """
+
+
+def _leader_fields(row: dict) -> dict:
+    """
+    What to report about a crew's leader, using the same two-part rule as
+    worker eligibility: the availability table must say 'available' AND
+    the leader must not already be committed to another job that day.
+    An accepted job does not flip availability to 'booked' until it is
+    confirmed, so checking the availability table alone would overstate
+    the leader's freedom.
+    """
+    if not row["leader_name"]:
+        return {"crew_leader": None, "crew_leader_available": None,
+                "crew_leader_status": None}
+
+    if row["leader_committed"]:
+        status = "committed to another job that day"
+    else:
+        status = row["leader_status"] or "no record"
+
+    return {
+        "crew_leader": row["leader_name"],
+        "crew_leader_available": (row["leader_status"] == "available"
+                                  and not row["leader_committed"]),
+        "crew_leader_status": status,
+    }
 
 
 def _query_params(request: WorkforceRequest) -> dict:
@@ -305,11 +345,7 @@ def find_workers(request: WorkforceRequest) -> list[Candidate]:
                 # availability on the requested date travel with the worker.
                 "crew_id": row["crew_id"],
                 "crew_name": row["crew_name"],
-                "crew_leader": row["leader_name"],
-                "crew_leader_available": (row["leader_status"] == "available"
-                                          if row["leader_name"] else None),
-                "crew_leader_status": (row["leader_status"] or "no record"
-                                       if row["leader_name"] else None),
+                **_leader_fields(row),
             },
         ))
 
@@ -371,11 +407,7 @@ def find_crews(request: WorkforceRequest) -> list[Candidate]:
             evidence={
                 "location": info["location_name"],
                 "primary_trade": info["primary_trade"],
-                "crew_leader": info["leader_name"],
-                "crew_leader_available": (info["leader_status"] == "available"
-                                          if info["leader_name"] else None),
-                "crew_leader_status": (info["leader_status"] or "no record"
-                                       if info["leader_name"] else None),
+                **_leader_fields(info),
                 "crew_rating": _as_float(info["rating"]),
                 "crew_completed_jobs": info["completed_jobs"],
                 "qualified_available_members": len(members),

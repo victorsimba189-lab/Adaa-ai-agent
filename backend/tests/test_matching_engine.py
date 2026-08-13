@@ -14,7 +14,7 @@ from datetime import date, timedelta
 import pytest
 
 from app.agent.matching import WorkforceRequest, compose_workforce, find_crews, find_workers
-from app.database import fetch_all, fetch_one
+from app.database import connect, fetch_all, fetch_one
 
 GUNTUR_LAT, GUNTUR_LNG = 16.3067, 80.4365
 
@@ -152,10 +152,11 @@ def test_workers_carry_their_crew_and_its_leader():
             assert evidence["crew_leader"] == membership["leader_name"], candidate.id
 
 
-def test_crew_leader_availability_comes_from_the_availability_table():
+def test_crew_leader_availability_uses_the_same_rule_as_workers():
     """
-    Business rule 1: whether a crew's leader is free comes from the
-    availability table, nowhere else.
+    Business rule 1: a leader is reported free only if the availability
+    table says 'available' AND they are not already committed to another
+    job that day -- the same two-part rule the engine applies to workers.
     """
     for candidate in find_workers(mason_request()):
         if not candidate.evidence["crew_leader"]:
@@ -165,13 +166,83 @@ def test_crew_leader_availability_comes_from_the_availability_table():
             """
             select (select a.status from availability a
                      where a.worker_id = c.leader_worker_id
-                       and a.date = %s) as status
-              from crews c where c.id = %s
+                       and a.date = %(on_date)s) as status,
+                   exists (select 1
+                             from job_assignments ja
+                             join jobs j on j.id = ja.job_id
+                            where ja.worker_id = c.leader_worker_id
+                              and j.date = %(on_date)s
+                              and ja.status in ('accepted', 'confirmed'))
+                       as committed
+              from crews c where c.id = %(crew_id)s
             """,
-            (tomorrow(), candidate.evidence["crew_id"]),
+            {"on_date": tomorrow(), "crew_id": candidate.evidence["crew_id"]},
         )
         assert candidate.evidence["crew_leader_available"] == \
-            (leader["status"] == "available"), candidate.id
+            (leader["status"] == "available" and not leader["committed"]), \
+            candidate.id
+
+
+def test_an_accepted_job_makes_the_leader_unavailable():
+    """
+    Accepting a job does not change the availability table -- only a
+    confirmed assignment marks a worker booked. The engine must therefore
+    not report a leader as free while they hold an accepted assignment
+    elsewhere that day. This test writes to the database and cleans up
+    after itself.
+    """
+    leader = fetch_one(
+        """
+        select c.id as crew_id, c.leader_worker_id
+          from crews c
+          join availability a on a.worker_id = c.leader_worker_id
+         where a.date = %s and a.status = 'available'
+         limit 1
+        """,
+        (tomorrow(),),
+    )
+    if leader is None:
+        pytest.skip("no crew leader available tomorrow to test with")
+
+    job_id = "JOBTESTLEADER"
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into jobs (id, contractor_id, title, skill_required,
+                                      workers_required, date, start_time)
+                    values (%s, 'CON001', 'Leader conflict test', 'Mason',
+                            1, %s, '08:00')
+                    """,
+                    (job_id, tomorrow()),
+                )
+                cur.execute(
+                    """
+                    insert into job_assignments (job_id, worker_id,
+                                                 assignment_type, status)
+                    values (%s, %s, 'individual', 'accepted')
+                    """,
+                    (job_id, leader["leader_worker_id"]),
+                )
+            conn.commit()
+
+        seen = False
+        for candidate in find_workers(mason_request()) + find_crews(mason_request()):
+            if candidate.evidence.get("crew_id", candidate.id) != leader["crew_id"]:
+                continue
+            seen = True
+            assert candidate.evidence["crew_leader_available"] is False, candidate.id
+            assert candidate.evidence["crew_leader_status"] == \
+                "committed to another job that day", candidate.id
+        assert seen, "expected results mentioning the conflicted leader's crew"
+    finally:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("delete from job_assignments where job_id = %s",
+                            (job_id,))
+                cur.execute("delete from jobs where id = %s", (job_id,))
+            conn.commit()
 
 
 def test_crew_results_name_their_leader():
