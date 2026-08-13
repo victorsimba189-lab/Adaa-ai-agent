@@ -102,6 +102,11 @@ def search_workers(skill: str, location: str, on_date: str = "",
     is not already committed to another job, and is close enough to travel.
     Anyone failing any of those is not returned at all.
 
+    Each result also says which crew the worker belongs to (crew_name),
+    who leads that crew (crew_leader) and whether that leader is free on
+    the date (crew_leader_available). A worker with no crew has null in
+    those fields and works independently.
+
     Args:
         skill: the trade needed, for example "Mason" or "Carpenter".
         location: the place name, for example "Guntur".
@@ -135,7 +140,11 @@ def search_workers(skill: str, location: str, on_date: str = "",
         } for worker in found],
         "note": ("No verified workers with that skill are available there on "
                  "that date." if not found else
-                 "All of these are verified, skilled and free on the date."),
+                 "All of these are verified, skilled and free on the date. "
+                 "crew_name and crew_leader say which crew each worker "
+                 "belongs to and who leads it; crew_leader_available is "
+                 "whether that leader is free on the date. Nulls mean the "
+                 "worker is independent."),
     })
 
 
