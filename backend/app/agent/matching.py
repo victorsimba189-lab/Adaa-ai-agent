@@ -183,8 +183,23 @@ _WORKER_SQL = """
              where a2.worker_id = w.id
                and a2.status = 'available'
                and a2.date >= %(on_date)s
-               and a2.date < %(on_date)s::date + %(window)s::int) as free_days
+               and a2.date < %(on_date)s::date + %(window)s::int) as free_days,
+           crew.crew_id, crew.crew_name, crew.leader_id, crew.leader_name,
+           crew.leader_status
       from workers w
+      left join lateral (
+           select c.id as crew_id, c.name as crew_name,
+                  leader.id as leader_id, leader.name as leader_name,
+                  (select a3.status from availability a3
+                    where a3.worker_id = leader.id
+                      and a3.date = %(on_date)s) as leader_status
+             from crew_members cm
+             join crews c on c.id = cm.crew_id
+             left join workers leader on leader.id = c.leader_worker_id
+            where cm.worker_id = w.id and cm.status = 'active'
+            order by cm.joined_at desc, c.id
+            limit 1
+      ) crew on true
       join worker_skills ws on ws.worker_id = w.id
                            and ws.verification_status = 'verified'
       join skills s on s.id = ws.skill_id
@@ -208,6 +223,11 @@ _CREW_MEMBER_SQL = """
            c.location_name, c.location_lat, c.location_lng,
            c.travel_radius_km, c.rating, c.reliability_score,
            c.completed_jobs, c.verification_status, c.availability_status,
+           (select leader.name from workers leader
+             where leader.id = c.leader_worker_id) as leader_name,
+           (select a3.status from availability a3
+             where a3.worker_id = c.leader_worker_id
+               and a3.date = %(on_date)s) as leader_status,
            w.id as worker_id, w.name as worker_name,
            w.experience_years, ws.years_experience as skill_years,
            (select count(*)
@@ -280,6 +300,16 @@ def find_workers(request: WorkforceRequest) -> list[Candidate]:
                 "attendance_rate": _as_float(row["attendance_rate"]),
                 "reliability_score": _as_float(row["reliability_score"]),
                 "free_days_next_week": row["free_days"],
+                # Which crew this worker belongs to, if any. A contractor
+                # deals with the crew's leader, so the leader's name and
+                # availability on the requested date travel with the worker.
+                "crew_id": row["crew_id"],
+                "crew_name": row["crew_name"],
+                "crew_leader": row["leader_name"],
+                "crew_leader_available": (row["leader_status"] == "available"
+                                          if row["leader_name"] else None),
+                "crew_leader_status": (row["leader_status"] or "no record"
+                                       if row["leader_name"] else None),
             },
         ))
 
@@ -341,6 +371,11 @@ def find_crews(request: WorkforceRequest) -> list[Candidate]:
             evidence={
                 "location": info["location_name"],
                 "primary_trade": info["primary_trade"],
+                "crew_leader": info["leader_name"],
+                "crew_leader_available": (info["leader_status"] == "available"
+                                          if info["leader_name"] else None),
+                "crew_leader_status": (info["leader_status"] or "no record"
+                                       if info["leader_name"] else None),
                 "crew_rating": _as_float(info["rating"]),
                 "crew_completed_jobs": info["completed_jobs"],
                 "qualified_available_members": len(members),

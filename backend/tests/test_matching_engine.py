@@ -114,6 +114,86 @@ def test_crew_supply_counts_only_qualified_available_members():
         )["n"]
 
 
+def test_workers_carry_their_crew_and_its_leader():
+    """
+    A contractor dealing with an individual worker still deals with that
+    worker's crew leader, so every suggested worker must say which crew
+    they belong to and who leads it -- from the database, never guessed.
+    """
+    workers = find_workers(mason_request())
+    assert workers, "expected some masons"
+
+    for candidate in workers:
+        evidence = candidate.evidence
+        assert "crew_name" in evidence
+        assert "crew_leader" in evidence
+        assert "crew_leader_available" in evidence
+
+        membership = fetch_one(
+            """
+            select c.id as crew_id, c.name as crew_name,
+                   leader.name as leader_name
+              from crew_members cm
+              join crews c on c.id = cm.crew_id
+              left join workers leader on leader.id = c.leader_worker_id
+             where cm.worker_id = %s and cm.status = 'active'
+             order by cm.joined_at desc, c.id
+             limit 1
+            """,
+            (candidate.id,),
+        )
+        if membership is None:
+            assert evidence["crew_name"] is None, candidate.id
+            assert evidence["crew_leader"] is None, candidate.id
+            assert evidence["crew_leader_available"] is None, candidate.id
+        else:
+            assert evidence["crew_id"] == membership["crew_id"], candidate.id
+            assert evidence["crew_name"] == membership["crew_name"], candidate.id
+            assert evidence["crew_leader"] == membership["leader_name"], candidate.id
+
+
+def test_crew_leader_availability_comes_from_the_availability_table():
+    """
+    Business rule 1: whether a crew's leader is free comes from the
+    availability table, nowhere else.
+    """
+    for candidate in find_workers(mason_request()):
+        if not candidate.evidence["crew_leader"]:
+            continue
+
+        leader = fetch_one(
+            """
+            select (select a.status from availability a
+                     where a.worker_id = c.leader_worker_id
+                       and a.date = %s) as status
+              from crews c where c.id = %s
+            """,
+            (tomorrow(), candidate.evidence["crew_id"]),
+        )
+        assert candidate.evidence["crew_leader_available"] == \
+            (leader["status"] == "available"), candidate.id
+
+
+def test_crew_results_name_their_leader():
+    crews = find_crews(mason_request())
+    assert crews, "expected some crews"
+
+    for crew in crews:
+        assert "crew_leader" in crew.evidence
+        assert "crew_leader_available" in crew.evidence
+
+        row = fetch_one(
+            """
+            select leader.name as leader_name
+              from crews c
+              left join workers leader on leader.id = c.leader_worker_id
+             where c.id = %s
+            """,
+            (crew.id,),
+        )
+        assert crew.evidence["crew_leader"] == row["leader_name"], crew.id
+
+
 # --- composition -----------------------------------------------------------
 
 def test_the_eight_mason_scenario_is_filled():
